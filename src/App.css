@@ -1390,57 +1390,13 @@ input[type=number].clean-number {
    ================================================ */
 
 #feder-print-root {
-    display: none; /* hidden on screen at all times */
-}
-
-/* When browser print dialog is open, show only the print root */
-@media print {
-    body > * {
-        display: none !important;
-    }
-
-    body > #feder-print-root {
-        display: block !important;
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: auto;
-    }
-
-    #feder-print-root {
-        display: block !important;
-    }
-
-    /* Inside the print root, make preview fill the page */
-    #feder-print-root .preview-container-wrapper {
-        display: block !important;
-        height: auto !important;
-        overflow: visible !important;
-    }
-
-    /* Hide tab controls, show only the visualization */
-    #feder-print-root .preview-tabs-header {
-        display: none !important;
-    }
-
-    #feder-print-root .preview-tab-content {
-        display: block !important;
-        overflow: visible !important;
-        height: auto !important;
-    }
-
-    #feder-print-root .panel-preview {
-        display: block !important;
-        height: auto !important;
-        overflow: visible !important;
-    }
-
-    #feder-print-root .preview-content {
-        overflow: visible !important;
-        height: auto !important;
-        max-height: none !important;
-    }
+    display: block;
+    position: fixed;
+    left: -9999px;
+    top: 0;
+    width: 850px;
+    opacity: 0;
+    pointer-events: none;
 }
 
 /* Labeled Equations & Table Captions styling */

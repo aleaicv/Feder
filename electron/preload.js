@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getVersion: () => ipcRenderer.invoke('app:getVersion'),
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
     openPath: (path) => ipcRenderer.invoke('shell:openPath', path),
+    exportPdf: (data) => ipcRenderer.invoke('export:pdf', data),
     isElectron: true
 });
 

@@ -110,7 +110,65 @@ ipcMain.handle('fs:delete', async (_, targetPath) => {
 ipcMain.handle('fs:rename', async (_, { oldPath, newPath }) => {
     return await fs.rename(oldPath, newPath);
 });
+
+ipcMain.handle('export:pdf', async (event, { html, defaultFilename }) => {
+    const parentWin = BrowserWindow.fromWebContents(event.sender);
+    const { canceled, filePath } = await dialog.showSaveDialog(parentWin, {
+        title: 'Export PDF',
+        defaultPath: defaultFilename || 'document.pdf',
+        filters: [
+            { name: 'PDF Documents', extensions: ['pdf'] }
+        ]
+    });
+
+    if (canceled || !filePath) {
+        return { canceled: true };
+    }
+
+    const tempPath = path.join(app.getPath('temp'), `feder_print_${Date.now()}_${Math.random().toString(36).slice(2)}.html`);
+    const printWin = new BrowserWindow({
+        show: false,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true
+        }
+    });
+
+    try {
+        await fs.writeFile(tempPath, html, 'utf-8');
+        await printWin.loadFile(tempPath);
+
+        // Wait for document and fonts to settle
+        await printWin.webContents.executeJavaScript(`
+            Promise.all([
+                document.fonts ? document.fonts.ready : Promise.resolve(),
+                new Promise(resolve => setTimeout(resolve, 300))
+            ])
+        `).catch(() => {});
+
+        const pdfBuffer = await printWin.webContents.printToPDF({
+            pageSize: 'A4',
+            printBackground: true,
+            margins: {
+                top: 0.4,
+                bottom: 0.4,
+                left: 0.4,
+                right: 0.4
+            }
+        });
+
+        await fs.writeFile(filePath, pdfBuffer);
+        return { success: true, filePath };
+    } catch (err) {
+        console.error('Failed to export PDF:', err);
+        throw err;
+    } finally {
+        printWin.close();
+        await fs.unlink(tempPath).catch(() => {});
+    }
+});
 // End IPC Handlers
+
 
 ipcMain.handle('app:getVersion', () => {
     return app.getVersion();

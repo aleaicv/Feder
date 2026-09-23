@@ -19,7 +19,9 @@ import { SettingsModal } from './components/SettingsModal';
 import { StatusBar } from './components/StatusBar';
 import { PdfExportModal } from './components/PdfExportModal';
 import { DocumentTabs } from './components/DocumentTabs';
-import html2pdf from 'html2pdf.js';
+import { Feather } from 'lucide-react';
+import { preloadFigures, preloadBibData, buildPrintHtmlDocument, executePdfExport } from './utils/pdfExport';
+import { MarkdownPreview } from './components/Preview';
 
 const isElectron = /Electron/i.test(navigator.userAgent);
 
@@ -639,11 +641,11 @@ function App() {
 
   // Dirty state tracking - set to true whenever content or metadata changes
   useEffect(() => {
-    // We only want to set dirty if we are NOT in the middle of loading
-    if (!isLoading && viewState === 'editor') {
+    // We only want to set dirty if we are NOT in the middle of loading and a file is open
+    if (!isLoading && viewState === 'editor' && currentFile?.name) {
       setIsDirty(true);
     }
-  }, [content, metadata, projectMetadata]);
+  }, [content, metadata, projectMetadata, currentFile?.name]);
 
   // Reset dirty state when a new file is explicitly loaded or saved
   // This is handled inside handleSave and handleFileSelect/openDirectoryWithHandle
@@ -918,6 +920,7 @@ function App() {
       saveFileAs: latestSaveFileAs
     } = latestStateRef.current;
 
+    if (!latestCurrentFile || !latestCurrentFile.name) return;
     if (latestCurrentFile.kind === 'image') return; // Cannot save image changes yet
 
     const fullContent = stringifyFileContent();
@@ -950,9 +953,9 @@ function App() {
 
         if (latestCurrentFile.handle) {
           await latestSaveFile(fullContent, latestCurrentFile.handle);
-        } else {
+        } else if (latestCurrentFile.name) {
           // Fallback / New File in Project
-          const name = latestCurrentFile.name || 'main.md';
+          const name = latestCurrentFile.name;
           const handle = await writeFileInDir(latestDirHandle, name, fullContent);
           setFileHandle(handle);
           setCurrentFile(prev => ({ ...prev, handle }));
@@ -1228,10 +1231,22 @@ function App() {
         }
       }
 
+      // Preload bibliography and figures so all data is ready synchronously for export
+      const { dirHandle: currentDirHandle, projectMetadata: currentProjectMetadata } = latestStateRef.current;
+      const effectiveDirHandle = dirHandle || currentDirHandle;
+      const effectiveProjectMetadata = projectMetadata || currentProjectMetadata;
+      const bibData = await preloadBibData(fileMeta, effectiveDirHandle);
+      const contentWithFigures = await preloadFigures(fileContent, effectiveDirHandle, selectedFile.path, effectiveProjectMetadata);
+
       setPrintData({ 
-        content: fileContent, 
+        content: contentWithFigures, 
         metadata: fileMeta, 
-        filename: selectedFile.name.replace(/\.md$/, '.pdf') 
+        bibData,
+        filename: selectedFile.name.replace(/\.md$/, '.pdf'),
+        title: fileMeta.title || selectedFile.name.replace(/\.md$/, ''),
+        filePath: selectedFile.path,
+        dirHandle: effectiveDirHandle,
+        projectMetadata: effectiveProjectMetadata
       });
       setPrintMode(true);
     } catch (e) {
@@ -1239,14 +1254,19 @@ function App() {
       alert('Failed to prepare file for export: ' + (e.message || e));
       setIsLoading(false);
     }
-  }, []);
+  }, [dirHandle, projectMetadata]);
 
-  // Trigger print when printMode becomes true, restore after
+  // Trigger export when printMode becomes true and printData is ready
   useEffect(() => {
-    if (!printMode) return;
-    
-    // Wait one render cycle so the print Preview has mounted
-    const timer = setTimeout(() => {
+    if (!printMode || !printData) return;
+
+    let isCancelled = false;
+
+    const runExport = async () => {
+      // Allow time for React to mount the DOM and render KaTeX formulas
+      await new Promise(resolve => setTimeout(resolve, 350));
+      if (isCancelled) return;
+
       const element = document.getElementById('feder-print-root');
       if (!element) {
         setPrintMode(false);
@@ -1254,61 +1274,31 @@ function App() {
         return;
       }
 
-      // Temporarily override styles if needed so html2pdf can render it
-      // html2pdf clones the element, so as long as it's visible in the DOM it works.
-      // But because our CSS hides it except @media print, we must force it visible briefly
-      // or ensure html2pdf is fine with it (html2pdf actually renders what's on screen).
-      // Let's force it visible for the render.
-      const prevDisplay = element.style.display;
-      const prevPosition = element.style.position;
-      const prevVisibility = element.style.visibility;
-      const prevHeight = element.style.height;
-      const prevOverflow = element.style.overflow;
+      try {
+        const renderedHtml = element.innerHTML;
+        const fullHtml = buildPrintHtmlDocument(renderedHtml, printData.title || printData.filename);
 
-      element.style.display = 'block';
-      element.style.position = 'absolute';
-      element.style.visibility = 'visible'; // Keep it visible but out of way
-      element.style.top = '-9999px';
-      element.style.left = '-9999px';
-      element.style.height = 'auto';
-      element.style.overflow = 'visible';
-
-      html2pdf()
-        .from(element)
-        .set({
-          margin: 15,
-          filename: printData.filename || 'export.pdf',
-          image: { type: 'jpeg', quality: 0.98 },
-          html2canvas: { scale: 2, useCORS: true, logging: false },
-          jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-        })
-        .save()
-        .then(() => {
-          element.style.display = prevDisplay;
-          element.style.position = prevPosition;
-          element.style.visibility = prevVisibility;
-          element.style.height = prevHeight;
-          element.style.overflow = prevOverflow;
-          
+        const result = await executePdfExport(fullHtml, printData.filename);
+        if (result?.success && result?.filePath) {
+          console.log('[PDF Export] Successfully exported to:', result.filePath);
+        }
+      } catch (err) {
+        console.error('PDF generation failed:', err);
+        alert('PDF Export failed: ' + (err.message || err));
+      } finally {
+        if (!isCancelled) {
           setPrintMode(false);
           setIsLoading(false);
-        })
-        .catch(err => {
-          console.error("PDF generation failed", err);
-          element.style.display = prevDisplay;
-          element.style.position = prevPosition;
-          element.style.visibility = prevVisibility;
-          element.style.height = prevHeight;
-          element.style.overflow = prevOverflow;
+        }
+      }
+    };
 
-          setPrintMode(false);
-          setIsLoading(false);
-          alert("PDF Export failed");
-        });
-    }, 500);
-    
-    return () => clearTimeout(timer);
-  }, [printMode, printData.filename]);
+    runExport();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [printMode, printData]);
 
   const handleImport = useCallback(async () => {
     const { dirHandle: latestDirHandle, handleFileSelect: latestHandleFileSelect } = latestStateRef.current;
@@ -1436,8 +1426,8 @@ function App() {
   const handleCloseTab = useCallback(async (tabToClose) => {
     const { isDirty: latestIsDirty, handleSave: latestHandleSave, currentFile: latestCurrentFile, openTabs: latestOpenTabs } = latestStateRef.current;
 
-    // Autosave if the tab being closed is currently active and has unsaved changes
-    if (tabToClose.name === latestCurrentFile.name && latestIsDirty) {
+    // Autosave if the tab being closed is currently active, dirty, and has a file name
+    if (tabToClose.name === latestCurrentFile.name && latestIsDirty && latestCurrentFile.name) {
       await latestHandleSave();
     }
 
@@ -1460,6 +1450,7 @@ function App() {
         setMetadata({});
         setCurrentFile({ name: '', kind: 'md', handle: null });
         setFileHandle(null);
+        setTimeout(() => setIsDirty(false), 50);
       }
     }
   }, [handleFileSelect]);
@@ -1857,7 +1848,7 @@ function App() {
           {/* Controls moved to Layout header */}
         </div>
 
-        {enableDocumentTabs && openTabs.length > 0 && (
+        {enableDocumentTabs && (
           <DocumentTabs
             tabs={openTabs}
             activeTabName={currentFile.name}
@@ -1867,45 +1858,50 @@ function App() {
           />
         )}
 
-        {currentFile.kind === 'md' && showMetadata && (
-          <MetadataForm
-            mode={mode}
-            metadata={metadata}
-            onChange={setMetadata}
-            isNote={currentFile.name && (currentFile.name.startsWith('notes/') || currentFile.name.includes('/notes/'))}
-            isIdea={currentFile.name && (currentFile.name.startsWith('ideas/') || currentFile.name.includes('/ideas/'))}
-            notesList={notesList || []}
-            bibFiles={bibFiles || []}
-            currentFilename={currentFile.name}
-            projectMetadata={projectMetadata}
-          />
-        )}
-
-        {currentFile.kind === 'image' ? (
+        {!currentFile.name ? (
+          <div className="editor-empty-workspace">
+            <Feather size={80} className="editor-empty-feather" />
+          </div>
+        ) : currentFile.kind === 'image' ? (
           <ImageViewer src={currentFile.src} alt={currentFile.name} />
         ) : (
-          <div className="editor-container" style={{ flex: 1, overflow: 'hidden' }}>
-            <Editor
-              key={currentFile.name || 'empty'}
-              value={content}
-              onChange={setContent}
-              mode={mode}
-              onUploadImage={onUploadImage}
-              onPasteImage={onPasteImage}
-              settings={settings}
-              projectMetadata={projectMetadata}
-              onAiThinking={setIsAiThinking}
-              onRequestImprovement={handleRequestImprovement}
-              onSelectionChange={setEditorSelection}
-              onRegisterCancel={(fn) => { cancelAiRef.current = fn; }}
-              onRegisterJumpTo={(fn) => { jumpToWordRef.current = fn; }}
-              comments={metadata?.comments || []}
-              commentTags={projectMetadata?.commentTags || DEFAULT_COMMENT_TAGS}
-              onAddComment={handleAddComment}
-              onCommentPositionsChange={setCommentPositions}
-              onEditorScrollChange={setEditorScrollTop}
-            />
-          </div>
+          <>
+            {currentFile.kind === 'md' && showMetadata && (
+              <MetadataForm
+                mode={mode}
+                metadata={metadata}
+                onChange={setMetadata}
+                isNote={currentFile.name && (currentFile.name.startsWith('notes/') || currentFile.name.includes('/notes/'))}
+                isIdea={currentFile.name && (currentFile.name.startsWith('ideas/') || currentFile.name.includes('/ideas/'))}
+                notesList={notesList || []}
+                bibFiles={bibFiles || []}
+                currentFilename={currentFile.name}
+                projectMetadata={projectMetadata}
+              />
+            )}
+            <div className="editor-container" style={{ flex: 1, overflow: 'hidden' }}>
+              <Editor
+                key={currentFile.name || 'empty'}
+                value={content}
+                onChange={setContent}
+                mode={mode}
+                onUploadImage={onUploadImage}
+                onPasteImage={onPasteImage}
+                settings={settings}
+                projectMetadata={projectMetadata}
+                onAiThinking={setIsAiThinking}
+                onRequestImprovement={handleRequestImprovement}
+                onSelectionChange={setEditorSelection}
+                onRegisterCancel={(fn) => { cancelAiRef.current = fn; }}
+                onRegisterJumpTo={(fn) => { jumpToWordRef.current = fn; }}
+                comments={metadata?.comments || []}
+                commentTags={projectMetadata?.commentTags || DEFAULT_COMMENT_TAGS}
+                onAddComment={handleAddComment}
+                onCommentPositionsChange={setCommentPositions}
+                onEditorScrollChange={setEditorScrollTop}
+              />
+            </div>
+          </>
         )}
       </div>
     );
@@ -1930,51 +1926,61 @@ function App() {
     }
   }, []);
 
-  const renderRight = () => (
-    <Preview
-      settings={settings}
-      content={previewContent}
-      metadata={metadata}
-      projectMetadata={projectMetadata}
-      dirHandle={dirHandle}
-      mode={mode}
-      paperView={paperView}
-      onUpdateContent={handleUpdateFromPreview}
+  const renderRight = () => {
+    if (!currentFile.name) {
+      return (
+        <div className="preview-empty-workspace">
+          <Feather size={64} className="preview-empty-feather" />
+        </div>
+      );
+    }
 
-      onUpdateMetadata={setMetadata}
-      onNavigateToWord={handleNavigateToWord}
+    return (
+      <Preview
+        settings={settings}
+        content={previewContent}
+        metadata={metadata}
+        projectMetadata={projectMetadata}
+        dirHandle={dirHandle}
+        mode={mode}
+        paperView={paperView}
+        onUpdateContent={handleUpdateFromPreview}
 
-      // Tabs & Improvements
-      activeTab={rightPanelTab}
-      onTabChange={setRightPanelTab}
-      improvementData={improvementData}
-      onApplyImprovement={handleApplyImprovement}
-      onRetryImprovement={handleRequestImprovement}
+        onUpdateMetadata={setMetadata}
+        onNavigateToWord={handleNavigateToWord}
 
-      // Comments - only pass changing values if comments tab is active
-      editorSelection={rightPanelTab === 'comments' ? editorSelection : null}
-      onAddComment={handleAddComment}
-      onReplyComment={handleReplyComment}
-      onResolveComment={handleResolveComment}
-      onDeleteComment={handleDeleteComment}
-      commentPositions={rightPanelTab === 'comments' ? commentPositions : EMPTY_ARRAY}
-      editorScrollTop={rightPanelTab === 'comments' ? editorScrollTop : 0}
+        // Tabs & Improvements
+        activeTab={rightPanelTab}
+        onTabChange={setRightPanelTab}
+        improvementData={improvementData}
+        onApplyImprovement={handleApplyImprovement}
+        onRetryImprovement={handleRequestImprovement}
 
-      // Notes Graph
-      hasNotesDir={hasNotesDir}
-      notesList={notesList}
-      bibFiles={bibFiles}
-      onFileSelect={handleFileSelect}
-      currentFilename={currentFile.name}
+        // Comments - only pass changing values if comments tab is active
+        editorSelection={rightPanelTab === 'comments' ? editorSelection : null}
+        onAddComment={handleAddComment}
+        onReplyComment={handleReplyComment}
+        onResolveComment={handleResolveComment}
+        onDeleteComment={handleDeleteComment}
+        commentPositions={rightPanelTab === 'comments' ? commentPositions : EMPTY_ARRAY}
+        editorScrollTop={rightPanelTab === 'comments' ? editorScrollTop : 0}
 
-      // Ideas Graph
-      hasIdeasDir={hasIdeasDir}
-      isEditingNote={!!(currentFile.name && (currentFile.name.startsWith('notes/') || currentFile.name.includes('/notes/')))}
-      isEditingIdea={!!(currentFile.name && (currentFile.name.startsWith('ideas/') || currentFile.name.includes('/ideas/')))}
-      // Ideas Graph only needs content when active
-      currentFileContent={rightPanelTab === 'ideas-graph' ? content : ''}
-    />
-  );
+        // Notes Graph
+        hasNotesDir={hasNotesDir}
+        notesList={notesList}
+        bibFiles={bibFiles}
+        onFileSelect={handleFileSelect}
+        currentFilename={currentFile.name}
+
+        // Ideas Graph
+        hasIdeasDir={hasIdeasDir}
+        isEditingNote={!!(currentFile.name && (currentFile.name.startsWith('notes/') || currentFile.name.includes('/notes/')))}
+        isEditingIdea={!!(currentFile.name && (currentFile.name.startsWith('ideas/') || currentFile.name.includes('/ideas/')))}
+        // Ideas Graph only needs content when active
+        currentFileContent={rightPanelTab === 'ideas-graph' ? content : ''}
+      />
+    );
+  };
 
   latestStateRef.current = { 
     content, 
@@ -2015,42 +2021,38 @@ function App() {
           mode={mode}
           onExport={handlePdfExport}
           onClose={() => setShowPdfModal(false)}
+          currentFilename={currentFile?.name}
         />
       )}
 
-      {/* Hidden Print Preview — rendered off-screen, shown only by @media print */}
-      {printMode && (
-        <div id="feder-print-root">
-          <Preview
-            settings={settings}
+      {/* Hidden Print Host — rendered off-screen to capture HTML for PDF export */}
+      {printMode && printData && (
+        <div
+          id="feder-print-root"
+          className="feder-print-host"
+          style={{
+            position: 'fixed',
+            left: '-9999px',
+            top: 0,
+            width: '850px',
+            opacity: 0,
+            pointerEvents: 'none',
+            background: '#ffffff',
+            color: '#000000'
+          }}
+        >
+          <MarkdownPreview
             content={printData.content}
             metadata={printData.metadata}
-            projectMetadata={projectMetadata}
-            dirHandle={dirHandle}
+            projectMetadata={printData.projectMetadata || projectMetadata}
+            dirHandle={printData.dirHandle || dirHandle}
             mode={mode}
             paperView={true}
+            isPrinting={true}
+            preloadedBibData={printData.bibData}
+            filePath={printData.filePath}
             onUpdateContent={() => {}}
             onUpdateMetadata={() => {}}
-            activeTab="visualization"
-            onTabChange={() => {}}
-            improvementData={{ status: 'idle', originalText: '', improvedText: '', type: '', error: null }}
-            onApplyImprovement={() => {}}
-            onRetryImprovement={() => {}}
-            editorSelection=""
-            onAddComment={() => {}}
-            onReplyComment={() => {}}
-            onResolveComment={() => {}}
-            onDeleteComment={() => {}}
-            commentPositions={[]}
-            editorScrollTop={0}
-            hasNotesDir={false}
-            notesList={[]}
-            onFileSelect={() => {}}
-            currentFilename=""
-            hasIdeasDir={false}
-            isEditingNote={false}
-            isEditingIdea={false}
-            currentFileContent=""
           />
         </div>
       )}

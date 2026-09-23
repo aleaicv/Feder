@@ -13,7 +13,11 @@ export function DocumentTabs({
     const ribbonRef = useRef(null);
 
     if (!tabs || tabs.length === 0) {
-        return null;
+        return (
+            <div className="document-tabs-ribbon empty">
+                <span className="document-tabs-empty-text">No open tabs</span>
+            </div>
+        );
     }
 
     const handleWheel = (e) => {

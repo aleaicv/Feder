@@ -9,6 +9,7 @@ import 'katex/dist/katex.min.css';
 import { ChevronDown, ChevronRight, List, FileText, Sparkles, MessageSquare, Check, X as XIcon, RefreshCw, Send, Trash2, Network, Lightbulb, FileSymlink } from 'lucide-react';
 import { NotesGraph } from './NotesGraph';
 import { IdeasGraph } from './IdeasGraph';
+import { resolveImageFile, arrayBufferToDataUrl, getMimeType } from '../utils/imageResolver';
 
 const STATIC_REMARK_PLUGINS = [remarkMath, remarkGfm];
 const STATIC_REHYPE_PLUGINS = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeKatex];
@@ -197,7 +198,7 @@ export const getClickedWordInfo = (e) => {
 };
 
 // BibTeX, Citation, and Reference Helpers
-const parseBibTex = (text) => {
+export const parseBibTex = (text) => {
     const entries = {};
     const blocks = text.split(/^@/m).slice(1);
     blocks.forEach(block => {
@@ -229,7 +230,7 @@ const parseBibTex = (text) => {
     return entries;
 };
 
-const formatCitation = (key, entry, type = 'parenthetical', useAPA = true) => {
+export const formatCitation = (key, entry, type = 'parenthetical', useAPA = true) => {
     if (!useAPA) {
         return `[${key}]`;
     }
@@ -257,7 +258,7 @@ const formatCitation = (key, entry, type = 'parenthetical', useAPA = true) => {
     return `(${label}, ${year})`;
 };
 
-const ReferenceList = ({ bibData, citedKeys, useAPA = true }) => {
+export const ReferenceList = ({ bibData, citedKeys, useAPA = true }) => {
     if (!bibData || Object.keys(bibData).length === 0) return null;
 
     // Filter to show only cited keys? Or all? User said "add the references", usually implies all in bib or cited.
@@ -312,8 +313,28 @@ const ReferenceList = ({ bibData, citedKeys, useAPA = true }) => {
     );
 };
 
+// Helper to normalize width attributes (e.g. "50%", "0.5" -> "50%", 50 -> "50%", "300px" -> "300px")
+export const normalizeFigureWidth = (rawWidth) => {
+    if (!rawWidth) return '';
+    let clean = String(rawWidth).trim().replace(/^['"]|['",;]+$/g, '').trim();
+    if (!clean) return '';
+
+    // Decimal ratio (e.g., 0.5 or .5 -> 50%)
+    const num = parseFloat(clean);
+    if (!isNaN(num)) {
+        if (/^0?\.\d+$/.test(clean) && num > 0 && num <= 1) {
+            return `${Math.round(num * 100)}%`;
+        }
+        // Unitless integer <= 100: assume percentage (e.g., 50 -> 50%)
+        if (/^\d+$/.test(clean) && num > 0 && num <= 100) {
+            return `${num}%`;
+        }
+    }
+    return clean;
+};
+
 // Helper to process internal references (Figures, Tables, Equations)
-const processReferences = (text) => {
+export const processReferences = (text) => {
     if (!text) return { content: '', map: {} };
 
     // We process sequentially to build the map, then replace citations
@@ -324,25 +345,39 @@ const processReferences = (text) => {
     let eqCount = 0;
 
     // 1. Figures: ![Alt](Src){attributes}
-    // Support {width=100% #id} or {id=id width=100%} etc.
-    // Regex matches ![...](...){...}
-    content = content.replace(/!\[(.*?)\]\((.*?)\)\{(.*?)\}/g, (match, alt, src, attrs) => {
+    // Support {width=100% #id}, {id=id width=100%}, {width=50%}, {#fig:soft_story}, etc.
+    // Allow optional space before {
+    content = content.replace(/!\[(.*?)\]\((.*?)\)\s*\{([^}]+)\}/g, (match, alt, src, attrs) => {
         let width = '';
         let id = '';
         let label = '';
 
-        // Extract Width
-        const wMatch = attrs.match(/width=([^}\s]+)/);
-        if (wMatch) width = wMatch[1];
+        // Extract Width (width=..., width:..., or bare percentage e.g. 50%)
+        const wMatch = attrs.match(/width\s*[:=]\s*["']?([^}\s"',;]+)["']?/i) || attrs.match(/\b(\d+(?:\.\d+)?%)\b/);
+        if (wMatch) {
+            width = normalizeFigureWidth(wMatch[1]);
+        }
 
-        // Extract ID (#id or id=...)
-        const idMatch = attrs.match(/#([a-zA-Z0-9_\-]+)/) || attrs.match(/id=([a-zA-Z0-9_\-]+)/);
+        // Extract ID (#id or id=...), supporting colons, dots, dashes, underscores
+        const idMatch = attrs.match(/#([a-zA-Z0-9_:\.\-]+)/) || attrs.match(/id\s*[:=]\s*["']?([a-zA-Z0-9_:\.\-]+)["']?/i);
 
         if (idMatch) {
             id = idMatch[1];
             figCount++;
             label = `Figure ${figCount}`;
-            map[id] = { label, type: 'figure', num: figCount };
+            const info = { label, type: 'figure', num: figCount, id };
+            map[id] = info;
+
+            // Alias stripped ID (e.g. fig:soft_story -> soft_story)
+            const stripped = id.replace(/^(fig|figure):/i, '');
+            if (stripped && stripped !== id) {
+                map[stripped] = info;
+            }
+            // Alias prefixed ID (e.g. soft_story -> fig:soft_story)
+            if (!id.includes(':')) {
+                map[`fig:${id}`] = info;
+                map[`figure:${id}`] = info;
+            }
         }
 
         // Pack metadata into alt for AsyncImage to retrieve
@@ -354,7 +389,7 @@ const processReferences = (text) => {
     // Pattern A: Markdown tables followed by [caption]{#id} or {#id}
     const tableRegex = /((?:(?:\r?\n|^)[ \t]*\|[^\n]*\|[ \t]*)+)[\s\r\n]*(?:\[([^\]]+)\])?\s*\{([^}]+)\}/g;
     content = content.replace(tableRegex, (match, tableBlock, caption, attrs) => {
-        const idMatch = attrs.match(/#([a-zA-Z0-9_\-]+)/) || attrs.match(/id=([a-zA-Z0-9_\-]+)/);
+        const idMatch = attrs.match(/#([a-zA-Z0-9_:\.\-]+)/) || attrs.match(/id\s*[:=]\s*["']?([a-zA-Z0-9_:\.\-]+)["']?/i);
         let id = idMatch ? idMatch[1] : '';
 
         const bordersMatch = attrs.match(/borders=(true|false)/);
@@ -367,8 +402,20 @@ const processReferences = (text) => {
 
         tblCount++;
         const label = `Table ${tblCount}`;
+        let aliasAnchor = '';
         if (id) {
-            map[id] = { label, type: 'table', num: tblCount };
+            const info = { label, type: 'table', num: tblCount, id };
+            map[id] = info;
+            const stripped = id.replace(/^(tbl|table|tab):/i, '');
+            if (stripped && stripped !== id) {
+                map[stripped] = info;
+                aliasAnchor = `<span id="${stripped}"></span>`;
+            }
+            if (!id.includes(':')) {
+                map[`tbl:${id}`] = info;
+                map[`table:${id}`] = info;
+                map[`tab:${id}`] = info;
+            }
         }
 
         let tableClasses = ['table-container'];
@@ -380,13 +427,13 @@ const processReferences = (text) => {
         }
         if (centerText) tableClasses.push('center-text-table');
 
-        const captionHtml = `<div ${id ? `id="${id}"` : ''} class="table-caption" style="text-align:center; margin: 1.5em 0 0.5em 0; font-weight:500;"><strong>${label}</strong>${caption ? `: ${caption}` : ''}</div>`;
+        const captionHtml = `<div ${id ? `id="${id}"` : ''} class="table-caption" style="text-align:center; margin: 1.5em 0 0.5em 0; font-weight:500;">${aliasAnchor}<strong>${label}</strong>${caption ? `: ${caption}` : ''}</div>`;
         return `\n\n<div class="${tableClasses.join(' ')}">\n\n${captionHtml}\n\n${tableBlock}\n\n</div>\n\n`;
     });
 
     // Pattern B (Legacy): Table: Caption {#id}
     content = content.replace(/^Table:\s*(.*?)\s*\{([^}]+)\}/gm, (match, caption, attrs) => {
-        const idMatch = attrs.match(/#([a-zA-Z0-9_\-]+)/) || attrs.match(/id=([a-zA-Z0-9_\-]+)/);
+        const idMatch = attrs.match(/#([a-zA-Z0-9_:\.\-]+)/) || attrs.match(/id\s*[:=]\s*["']?([a-zA-Z0-9_:\.\-]+)["']?/i);
         let id = idMatch ? idMatch[1] : '';
 
         const bordersMatch = attrs.match(/borders=(true|false)/);
@@ -399,8 +446,20 @@ const processReferences = (text) => {
 
         tblCount++;
         const label = `Table ${tblCount}`;
+        let aliasAnchor = '';
         if (id) {
-            map[id] = { label, type: 'table', num: tblCount };
+            const info = { label, type: 'table', num: tblCount, id };
+            map[id] = info;
+            const stripped = id.replace(/^(tbl|table|tab):/i, '');
+            if (stripped && stripped !== id) {
+                map[stripped] = info;
+                aliasAnchor = `<span id="${stripped}"></span>`;
+            }
+            if (!id.includes(':')) {
+                map[`tbl:${id}`] = info;
+                map[`table:${id}`] = info;
+                map[`tab:${id}`] = info;
+            }
         }
 
         let tableClasses = ['table-container'];
@@ -412,29 +471,31 @@ const processReferences = (text) => {
         }
         if (centerText) tableClasses.push('center-text-table');
 
-        const captionHtml = `<div ${id ? `id="${id}"` : ''} class="table-caption" style="text-align:center; margin: 1em 0; font-weight:500;"><strong>${label}</strong>: ${caption}</div>`;
+        const captionHtml = `<div ${id ? `id="${id}"` : ''} class="table-caption" style="text-align:center; margin: 1em 0; font-weight:500;">${aliasAnchor}<strong>${label}</strong>: ${caption}</div>`;
         return `\n\n<div class="${tableClasses.join(' ')}">\n\n${captionHtml}\n\n</div>\n\n`;
     });
 
     // Helper to pre-render KaTeX to HTML so we bypass the markdown math pipeline
     const renderKatexBlock = (mathContent, id, eqNum, align = 'center') => {
+        const stripped = id ? id.replace(/^(eq|equation):/i, '') : '';
+        const aliasAnchor = (stripped && stripped !== id) ? `<span id="${stripped}"></span>` : '';
         try {
             const rendered = katex.renderToString(mathContent.trim() + `\\tag{${eqNum}}`, {
                 displayMode: true,
                 throwOnError: false,
             });
             const alignClass = align === 'left' ? 'align-left' : 'align-center';
-            return `\n<div id="${id}" class="labeled-equation katex-display ${alignClass}">${rendered}</div>\n`;
+            return `\n<div id="${id}" class="labeled-equation katex-display ${alignClass}">${aliasAnchor}${rendered}</div>\n`;
         } catch (e) {
             const alignClass = align === 'left' ? 'align-left' : 'align-center';
-            return `\n<div id="${id}" class="labeled-equation katex-display ${alignClass}"><span class="katex-error">${mathContent}\\tag{${eqNum}}</span></div>\n`;
+            return `\n<div id="${id}" class="labeled-equation katex-display ${alignClass}">${aliasAnchor}<span class="katex-error">${mathContent}\\tag{${eqNum}}</span></div>\n`;
         }
     };
 
     // 3. Equations:
     // Style A: $$ ... $$ {#id} or $$ ... $${#id}
     content = content.replace(/\$\$([\s\S]*?)\$\$\s*\{([^}]+)\}/g, (match, math, attrs) => {
-        const idMatch = attrs.match(/#([a-zA-Z0-9_\-]+)/) || attrs.match(/id=([a-zA-Z0-9_\-]+)/);
+        const idMatch = attrs.match(/#([a-zA-Z0-9_:\.\-]+)/) || attrs.match(/id\s*[:=]\s*["']?([a-zA-Z0-9_:\.\-]+)["']?/i);
         if (!idMatch) return match;
         const id = idMatch[1];
 
@@ -443,13 +504,20 @@ const processReferences = (text) => {
 
         eqCount++;
         const label = `Equation ${eqCount}`;
-        map[id] = { label, type: 'equation', num: eqCount };
+        const info = { label, type: 'equation', num: eqCount, id };
+        map[id] = info;
+        const stripped = id.replace(/^(eq|equation):/i, '');
+        if (stripped && stripped !== id) map[stripped] = info;
+        if (!id.includes(':')) {
+            map[`eq:${id}`] = info;
+            map[`equation:${id}`] = info;
+        }
         return renderKatexBlock(math, id, eqCount, align);
     });
 
     // Style B: $ ... $ {#id} or $ ... ${#id}
     content = content.replace(/\$([^$\n]+?)\$\s*\{([^}]+)\}/g, (match, math, attrs) => {
-        const idMatch = attrs.match(/#([a-zA-Z0-9_\-]+)/) || attrs.match(/id=([a-zA-Z0-9_\-]+)/);
+        const idMatch = attrs.match(/#([a-zA-Z0-9_:\.\-]+)/) || attrs.match(/id\s*[:=]\s*["']?([a-zA-Z0-9_:\.\-]+)["']?/i);
         if (!idMatch) return match;
         const id = idMatch[1];
 
@@ -458,36 +526,79 @@ const processReferences = (text) => {
 
         eqCount++;
         const label = `Equation ${eqCount}`;
-        map[id] = { label, type: 'equation', num: eqCount };
+        const info = { label, type: 'equation', num: eqCount, id };
+        map[id] = info;
+        const stripped = id.replace(/^(eq|equation):/i, '');
+        if (stripped && stripped !== id) map[stripped] = info;
+        if (!id.includes(':')) {
+            map[`eq:${id}`] = info;
+            map[`equation:${id}`] = info;
+        }
         return renderKatexBlock(math, id, eqCount, align);
     });
 
     // Style C (Legacy): $$ ... \label{id} ... $$
-    content = content.replace(/\$\$([\s\S]*?)\\label\{([a-zA-Z0-9_\-]+)\}([\s\S]*?)\$\$/g, (match, before, id, after) => {
+    content = content.replace(/\$\$([\s\S]*?)\\label\{([a-zA-Z0-9_:\.\-]+)\}([\s\S]*?)\$\$/g, (match, before, id, after) => {
         eqCount++;
         const label = `Equation ${eqCount}`;
-        map[id] = { label, type: 'equation', num: eqCount };
+        const info = { label, type: 'equation', num: eqCount, id };
+        map[id] = info;
+        const stripped = id.replace(/^(eq|equation):/i, '');
+        if (stripped && stripped !== id) map[stripped] = info;
+        if (!id.includes(':')) {
+            map[`eq:${id}`] = info;
+            map[`equation:${id}`] = info;
+        }
         return renderKatexBlock(before + after, id, eqCount);
     });
 
-    // 4. Resolve Citations: [type@id]
-    // Renders ONLY the numeric ID for figures, tables, and equations
-    content = content.replace(/\[(figure|table|equation)@([a-zA-Z0-9_\-]+)\]/g, (match, type, id) => {
-        if (map[id]) {
-            return `[${map[id].num}](#${id})`;
+    // 4. Resolve Cross-References in Text:
+    // Handles:
+    // - [figure@id], [fig@id], [table@id], [tbl@id], [tab@id], [equation@id], [eq@id], [ref@id]
+    // - Pandoc style: [@fig:id], [@tbl:id], [@eq:id]
+    // Smart prefix detection: if preceded by "Figure ", "Fig. ", "Table ", "Eq. ", etc., renders only the number "[1](#id)".
+    // Otherwise, renders "[Figure 1](#id)", "[Table 1](#id)", "[Equation 1](#id)".
+    const refRegex = /((?:(Figure|Fig\.?|Table|Tab\.?|Equation|Eq\.?)\s+)?)(?:\[(figure|fig|table|tbl|tab|equation|eq|ref)@([a-zA-Z0-9_:\.\-]+)\]|\[@(fig|figure|tbl|table|tab|eq|equation):([a-zA-Z0-9_:\.\-]+)\])/gi;
+
+    content = content.replace(refRegex, (match, prefix, prefixWord, type1, id1, type2, id2) => {
+        const rawId = id1 || id2;
+        const fullId = type2 ? `${type2}:${rawId}` : rawId;
+
+        const target = map[fullId] || map[rawId];
+        if (!target) {
+            return match; // Leave unreplaced if target not defined in document
         }
-        return `[?${type}@${id}?]`;
+
+        const anchorId = target.id || fullId;
+
+        if (prefixWord) {
+            // Document already includes "Figure ", "Eq. ", etc. before the tag
+            return `${prefix}[${target.num}](#${anchorId})`;
+        }
+
+        // Standalone tag without preceding element name: prefix with type
+        const typeLabel = target.type === 'figure' ? 'Figure' : target.type === 'table' ? 'Table' : 'Equation';
+        return `[${typeLabel} ${target.num}](#${anchorId})`;
     });
 
     return { content, map };
 };
 
-const MarkdownSection = React.memo(({ title, content, offset, dirHandle, onUpdateContent, activeAccentColor, metadata, projectMetadata, onDocumentLinkClick }) => {
+const MarkdownSection = React.memo(({ title, content, offset, dirHandle, onUpdateContent, activeAccentColor, metadata, projectMetadata, onDocumentLinkClick, isPrinting, filePath }) => {
     const [isOpen, setIsOpen] = useState(true);
 
     // Custom components with offset-aware checkbox logic
     const components = {
-        img: ({ node, ...props }) => <AsyncImage {...props} dirHandle={dirHandle} metadata={metadata} projectMetadata={projectMetadata} />,
+        img: ({ node, ...props }) => (
+            <AsyncImage
+                {...props}
+                dirHandle={dirHandle}
+                metadata={metadata}
+                projectMetadata={projectMetadata}
+                filePath={filePath}
+                isPrinting={isPrinting}
+            />
+        ),
 
         input: ({ node, ...props }) => {
             if (props.type === 'checkbox') {
@@ -563,6 +674,26 @@ const MarkdownSection = React.memo(({ title, content, offset, dirHandle, onUpdat
                         title={`Open document: ${docPath}`}
                     >
                         <FileSymlink size={14} className="document-link-icon" />
+                        {children}
+                    </a>
+                );
+            }
+            // Local anchor links (cross-references: #fig:..., #eq:..., #tbl:...)
+            if (href && href.startsWith('#')) {
+                const targetId = href.slice(1);
+                return (
+                    <a
+                        {...props}
+                        href={href}
+                        className="cross-ref-link"
+                        onClick={(e) => {
+                            const targetEl = document.getElementById(targetId) || document.getElementById(decodeURIComponent(targetId));
+                            if (targetEl) {
+                                e.preventDefault();
+                                targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                        }}
+                    >
                         {children}
                     </a>
                 );
@@ -646,7 +777,7 @@ const MarkdownSection = React.memo(({ title, content, offset, dirHandle, onUpdat
         );
     }
 
-    const isCollapsible = projectMetadata?.collapsibleSections;
+    const isCollapsible = projectMetadata?.collapsibleSections && !isPrinting;
 
     if (!isCollapsible) {
         return (
@@ -694,7 +825,7 @@ const MarkdownSection = React.memo(({ title, content, offset, dirHandle, onUpdat
     );
 });
 
-const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata, projectMetadata, dirHandle, mode, onUpdateContent, onUpdateMetadata, paperView, isEditingNote, isEditingIdea, onDocumentLinkClick, onNavigateToWord }) {
+export const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata, projectMetadata, dirHandle, mode, onUpdateContent, onUpdateMetadata, paperView, isEditingNote, isEditingIdea, onDocumentLinkClick, onNavigateToWord, isPrinting = false, preloadedBibData = null, filePath = '' }) {
     const [coverOpen, setCoverOpen] = useState(true);
     const [tocOpen, setTocOpen] = useState(true);
     const [isCtrlPressed, setIsCtrlPressed] = useState(false);
@@ -845,9 +976,13 @@ const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata,
     };
 
     // Load Bibliography
-    const [bibData, setBibData] = useState({});
+    const [bibData, setBibData] = useState(preloadedBibData || {});
 
     useEffect(() => {
+        if (preloadedBibData) {
+            setBibData(preloadedBibData);
+            return;
+        }
         const loadBib = async () => {
             if (!dirHandle) return;
             if (!metadata?.useReferences) {
@@ -890,7 +1025,7 @@ const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata,
             }
         };
         loadBib();
-    }, [dirHandle, metadata?.useReferences, metadata?.referencesFile]);
+    }, [dirHandle, metadata?.useReferences, metadata?.referencesFile, preloadedBibData]);
 
     // Process citations in content
     // Replace [@Key] or [cite@Key] with citation
@@ -915,7 +1050,7 @@ const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata,
                 keys.add(key);
                 return formatCitation(key, bibData[key], 'narrative', useAPA);
             })
-            .replace(/\[@([a-zA-Z0-9_\-]+)\]/g, (match, key) => {
+            .replace(/\[@(?!(?:fig|figure|eq|equation|tbl|table|tab):)([a-zA-Z0-9_\-]+)\]/g, (match, key) => {
                 keys.add(key);
                 return formatCitation(key, bibData[key], 'parenthetical', useAPA);
             });
@@ -961,223 +1096,389 @@ const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata,
 
                 {/* Engineer Cover Page */}
                 {isEngineer && (
-                    <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
-                        <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
-                            {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span>COVER PAGE</span>
+                    isPrinting ? (
+                        <header className="eng-cover-page">
+                            <div className="eng-client-block">
+                                <span className="label">CLIENT:</span>
+                                <span className="value">{client || '---'}</span>
+                            </div>
+                            <div className="eng-title-block">
+                                <h1 className="eng-report-title">{title || 'CALCULATION REPORT'}</h1>
+                            </div>
+                            <div className="eng-meta-grid">
+                                <div className="eng-meta-item">
+                                    <span className="label">PROJECT NO:</span>
+                                    <span className="value">{projectNumber || '---'}</span>
+                                </div>
+                                <div className="eng-meta-item">
+                                    <span className="label">DATE:</span>
+                                    <span className="value">{displayDate}</span>
+                                </div>
+                                <div className="eng-meta-item">
+                                    <span className="label">REVISION:</span>
+                                    <span className="value">{revision || 'Rev 0'}</span>
+                                </div>
+                            </div>
+                            <div className="eng-team-section">
+                                <h3>PREPARED BY:</h3>
+                                {renderedAuthors}
+                            </div>
+                            <div className="eng-approval-grid">
+                                <div className="approval-col">
+                                    <span className="label">CHECKED BY</span>
+                                    <span className="signature-line"></span>
+                                    <span className="value">{checkedBy || '---'}</span>
+                                </div>
+                                <div className="approval-col">
+                                    <span className="label">APPROVED BY</span>
+                                    <span className="signature-line"></span>
+                                    <span className="value">{approvedBy || '---'}</span>
+                                </div>
+                            </div>
+                            {abstract && (
+                                <div className="eng-summary-block">
+                                    <h3>EXECUTIVE SUMMARY</h3>
+                                    <p>{abstract}</p>
+                                </div>
+                            )}
+                        </header>
+                    ) : (
+                        <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
+                            <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
+                                {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                <span>COVER PAGE</span>
+                            </div>
+                            {coverOpen && (
+                                <header className="eng-cover-page">
+                                    <div className="eng-client-block">
+                                        <span className="label">CLIENT:</span>
+                                        <span className="value">{client || '---'}</span>
+                                    </div>
+                                    <div className="eng-title-block">
+                                        <h1 className="eng-report-title">{title || 'CALCULATION REPORT'}</h1>
+                                    </div>
+                                    <div className="eng-meta-grid">
+                                        <div className="eng-meta-item">
+                                            <span className="label">PROJECT NO:</span>
+                                            <span className="value">{projectNumber || '---'}</span>
+                                        </div>
+                                        <div className="eng-meta-item">
+                                            <span className="label">DATE:</span>
+                                            <span className="value">{displayDate}</span>
+                                        </div>
+                                        <div className="eng-meta-item">
+                                            <span className="label">REVISION:</span>
+                                            <span className="value">{revision || 'Rev 0'}</span>
+                                        </div>
+                                    </div>
+                                    <div className="eng-team-section">
+                                        <h3>PREPARED BY:</h3>
+                                        {renderedAuthors}
+                                    </div>
+                                    <div className="eng-approval-grid">
+                                        <div className="approval-col">
+                                            <span className="label">CHECKED BY</span>
+                                            <span className="signature-line"></span>
+                                            <span className="value">{checkedBy || '---'}</span>
+                                        </div>
+                                        <div className="approval-col">
+                                            <span className="label">APPROVED BY</span>
+                                            <span className="signature-line"></span>
+                                            <span className="value">{approvedBy || '---'}</span>
+                                        </div>
+                                    </div>
+                                    {abstract && (
+                                        <div className="eng-summary-block">
+                                            <h3>EXECUTIVE SUMMARY</h3>
+                                            <p>{abstract}</p>
+                                        </div>
+                                    )}
+                                </header>
+                            )}
                         </div>
-                        {coverOpen && (
-                            <header className="eng-cover-page">
-                                <div className="eng-client-block">
-                                    <span className="label">CLIENT:</span>
-                                    <span className="value">{client || '---'}</span>
-                                </div>
-                                <div className="eng-title-block">
-                                    <h1 className="eng-report-title">{title || 'CALCULATION REPORT'}</h1>
-                                </div>
-                                <div className="eng-meta-grid">
-                                    <div className="eng-meta-item">
-                                        <span className="label">PROJECT NO:</span>
-                                        <span className="value">{projectNumber || '---'}</span>
-                                    </div>
-                                    <div className="eng-meta-item">
-                                        <span className="label">DATE:</span>
-                                        <span className="value">{displayDate}</span>
-                                    </div>
-                                    <div className="eng-meta-item">
-                                        <span className="label">REVISION:</span>
-                                        <span className="value">{revision || 'Rev 0'}</span>
-                                    </div>
-                                </div>
-                                <div className="eng-team-section">
-                                    <h3>PREPARED BY:</h3>
-                                    {renderedAuthors}
-                                </div>
-                                <div className="eng-approval-grid">
-                                    <div className="approval-col">
-                                        <span className="label">CHECKED BY</span>
-                                        <span className="signature-line"></span>
-                                        <span className="value">{checkedBy || '---'}</span>
-                                    </div>
-                                    <div className="approval-col">
-                                        <span className="label">APPROVED BY</span>
-                                        <span className="signature-line"></span>
-                                        <span className="value">{approvedBy || '---'}</span>
-                                    </div>
-                                </div>
-                                {abstract && (
-                                    <div className="eng-summary-block">
-                                        <h3>EXECUTIVE SUMMARY</h3>
-                                        <p>{abstract}</p>
-                                    </div>
-                                )}
-
-                            </header>
-                        )}
-                    </div>
+                    )
                 )}
 
                 {/* Scriptwriter Cover Page */}
                 {isScript && (
-                    <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
-                        <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
-                            {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span>COVER PAGE</span>
+                    isPrinting ? (
+                        <header className="script-cover-page">
+                            <div className="script-title-container">
+                                <h1 className="script-title">{title || 'UNTITLED SCRIPT'}</h1>
+                                {author && (
+                                    <div className="script-author-block">
+                                        <span>written by</span>
+                                        <p className="script-author-name">{author}</p>
+                                    </div>
+                                )}
+                                {basedOn && (
+                                    <div className="script-based-block">
+                                        <span>based on</span>
+                                        <p>{basedOn}</p>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="script-footer-info">
+                                {date && <div className="script-date">{safeDate(date)}</div>}
+                                {contact && <div className="script-contact">{contact}</div>}
+                            </div>
+                        </header>
+                    ) : (
+                        <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
+                            <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
+                                {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                <span>COVER PAGE</span>
+                            </div>
+                            {coverOpen && (
+                                <header className="script-cover-page">
+                                    <div className="script-title-container">
+                                        <h1 className="script-title">{title || 'UNTITLED SCRIPT'}</h1>
+                                        {author && (
+                                            <div className="script-author-block">
+                                                <span>written by</span>
+                                                <p className="script-author-name">{author}</p>
+                                            </div>
+                                        )}
+                                        {basedOn && (
+                                            <div className="script-based-block">
+                                                <span>based on</span>
+                                                <p>{basedOn}</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="script-footer-info">
+                                        {date && <div className="script-date">{safeDate(date)}</div>}
+                                        {contact && <div className="script-contact">{contact}</div>}
+                                    </div>
+                                </header>
+                            )}
                         </div>
-                        {coverOpen && (
-                            <header className="script-cover-page">
-                                <div className="script-title-container">
-                                    <h1 className="script-title">{title || 'UNTITLED SCRIPT'}</h1>
-                                    {author && (
-                                        <div className="script-author-block">
-                                            <span>written by</span>
-                                            <p className="script-author-name">{author}</p>
-                                        </div>
-                                    )}
-                                    {basedOn && (
-                                        <div className="script-based-block">
-                                            <span>based on</span>
-                                            <p>{basedOn}</p>
-                                        </div>
-                                    )}
-                                </div>
-                                <div className="script-footer-info">
-                                    {date && <div className="script-date">{safeDate(date)}</div>}
-                                    {contact && <div className="script-contact">{contact}</div>}
-                                </div>
-
-                            </header>
-                        )}
-                    </div>
+                    )
                 )}
 
                 {/* Scholar Cover Page */}
                 {isScholar && showCover !== false && (
-                    <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
-                        <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
-                            {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span>COURSE COVER</span>
-                        </div>
-                        {coverOpen && (
-                            <header className="scholar-cover-page">
-                                <div className="scholar-course-tag">{course || 'COURSE NAME'}</div>
-                                <h1 className="scholar-lecture-title">{title || 'LECTURE NOTES'}</h1>
-                                <div className="scholar-meta-info">
-                                    <div className="meta-item">
-                                        <span className="label">STUDENT</span>
-                                        <span className="value">{displayAuthors || ''}</span>
-                                    </div>
-                                    <div className="meta-item">
-                                        <span className="label">DATE</span>
-                                        <span className="value">{displayDate}</span>
+                    isPrinting ? (
+                        <header className="scholar-cover-page">
+                            <div className="scholar-course-tag">{course || 'COURSE NAME'}</div>
+                            <h1 className="scholar-lecture-title">{title || 'LECTURE NOTES'}</h1>
+                            <div className="scholar-meta-info">
+                                <div className="meta-item">
+                                    <span className="label">STUDENT</span>
+                                    <span className="value">{displayAuthors || ''}</span>
+                                </div>
+                                <div className="meta-item">
+                                    <span className="label">DATE</span>
+                                    <span className="value">{displayDate}</span>
+                                </div>
+                            </div>
+                            {objectives && objectives.length > 0 && (
+                                <div className="scholar-objectives-preview">
+                                    <span className="label" style={{ display: 'block', marginBottom: 15, fontSize: '0.8rem', fontWeight: 800, color: 'var(--text-secondary)' }}>LECTURE OBJECTIVES</span>
+                                    <div className="scholar-checklist">
+                                        {objectives.map((obj, i) => {
+                                            const isChecked = /^\[[xX]\]\s+/.test(obj);
+                                            const displayText = obj.replace(/^\[[xX]\]\s+/, '');
+
+                                            return (
+                                                <div
+                                                    key={i}
+                                                    className={`checklist-item ${isChecked ? 'checked' : ''}`}
+                                                    style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}
+                                                >
+                                                    <div style={{
+                                                        width: 18,
+                                                        height: 18,
+                                                        border: `2px solid ${activeAccentColor}`,
+                                                        borderRadius: 4,
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        background: isChecked ? activeAccentColor : 'transparent',
+                                                        transition: 'all 0.2s'
+                                                    }}>
+                                                        {isChecked && <div style={{ width: 6, height: 10, borderBottom: '2px solid white', borderRight: '2px solid white', transform: 'rotate(45deg)', marginTop: -2 }}></div>}
+                                                    </div>
+                                                    <span style={{ fontSize: '1rem', textDecoration: isChecked ? 'line-through' : 'none', opacity: isChecked ? 0.7 : 1 }}>
+                                                        {displayText}
+                                                    </span>
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 </div>
-                                {objectives && objectives.length > 0 && (
-                                    <div className="scholar-objectives-preview">
-                                        <span className="label" style={{ display: 'block', marginBottom: 15, fontSize: '0.8rem', fontWeight: 800, color: 'var(--text-secondary)' }}>LECTURE OBJECTIVES</span>
-                                        <div className="scholar-checklist">
-                                            {objectives.map((obj, i) => {
-                                                const isChecked = /^\[[xX]\]\s+/.test(obj);
-                                                const displayText = obj.replace(/^\[[xX]\]\s+/, '');
-
-                                                return (
-                                                    <div
-                                                        key={i}
-                                                        className={`checklist-item ${isChecked ? 'checked' : ''}`}
-                                                        style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, cursor: onUpdateMetadata ? 'pointer' : 'default' }}
-                                                        onClick={() => toggleObjective(i)}
-                                                    >
-                                                        <div style={{
-                                                            width: 18,
-                                                            height: 18,
-                                                            border: `2px solid ${activeAccentColor}`,
-                                                            borderRadius: 4,
-                                                            display: 'flex',
-                                                            alignItems: 'center',
-                                                            justifyContent: 'center',
-                                                            background: isChecked ? activeAccentColor : 'transparent',
-                                                            transition: 'all 0.2s'
-                                                        }}>
-                                                            {isChecked && <div style={{ width: 6, height: 10, borderBottom: '2px solid white', borderRight: '2px solid white', transform: 'rotate(45deg)', marginTop: -2 }}></div>}
-                                                        </div>
-                                                        <span style={{ fontSize: '1rem', textDecoration: isChecked ? 'line-through' : 'none', opacity: isChecked ? 0.7 : 1 }}>
-                                                            {displayText}
-                                                        </span>
-                                                    </div>
-                                                );
-                                            })}
+                            )}
+                        </header>
+                    ) : (
+                        <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
+                            <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
+                                {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                <span>COURSE COVER</span>
+                            </div>
+                            {coverOpen && (
+                                <header className="scholar-cover-page">
+                                    <div className="scholar-course-tag">{course || 'COURSE NAME'}</div>
+                                    <h1 className="scholar-lecture-title">{title || 'LECTURE NOTES'}</h1>
+                                    <div className="scholar-meta-info">
+                                        <div className="meta-item">
+                                            <span className="label">STUDENT</span>
+                                            <span className="value">{displayAuthors || ''}</span>
+                                        </div>
+                                        <div className="meta-item">
+                                            <span className="label">DATE</span>
+                                            <span className="value">{displayDate}</span>
                                         </div>
                                     </div>
-                                )}
+                                    {objectives && objectives.length > 0 && (
+                                        <div className="scholar-objectives-preview">
+                                            <span className="label" style={{ display: 'block', marginBottom: 15, fontSize: '0.8rem', fontWeight: 800, color: 'var(--text-secondary)' }}>LECTURE OBJECTIVES</span>
+                                            <div className="scholar-checklist">
+                                                {objectives.map((obj, i) => {
+                                                    const isChecked = /^\[[xX]\]\s+/.test(obj);
+                                                    const displayText = obj.replace(/^\[[xX]\]\s+/, '');
 
-                            </header>
-                        )}
-                    </div>
+                                                    return (
+                                                        <div
+                                                            key={i}
+                                                            className={`checklist-item ${isChecked ? 'checked' : ''}`}
+                                                            style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, cursor: onUpdateMetadata ? 'pointer' : 'default' }}
+                                                            onClick={() => toggleObjective(i)}
+                                                        >
+                                                            <div style={{
+                                                                width: 18,
+                                                                height: 18,
+                                                                border: `2px solid ${activeAccentColor}`,
+                                                                borderRadius: 4,
+                                                                display: 'flex',
+                                                                alignItems: 'center',
+                                                                justifyContent: 'center',
+                                                                background: isChecked ? activeAccentColor : 'transparent',
+                                                                transition: 'all 0.2s'
+                                                            }}>
+                                                                {isChecked && <div style={{ width: 6, height: 10, borderBottom: '2px solid white', borderRight: '2px solid white', transform: 'rotate(45deg)', marginTop: -2 }}></div>}
+                                                            </div>
+                                                            <span style={{ fontSize: '1rem', textDecoration: isChecked ? 'line-through' : 'none', opacity: isChecked ? 0.7 : 1 }}>
+                                                                {displayText}
+                                                            </span>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    )}
+                                </header>
+                            )}
+                        </div>
+                    )
                 )}
 
                 {/* Journalist Cover/Header */}
                 {isJournalist && (
-                    <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
-                        <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
-                            {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <span>PRESS HEADER</span>
-                        </div>
-                        {coverOpen && (
-                            <header className="journal-header">
-                                <div className="journal-meta-top">
-                                    <span className="journal-dateline">{date ? safeDate(date) : new Date().toLocaleDateString()}</span>
-                                    <span className="journal-category">PRESS RELEASE / NEWS</span>
+                    isPrinting ? (
+                        <header className="journal-header">
+                            <div className="journal-meta-top">
+                                <span className="journal-dateline">{date ? safeDate(date) : new Date().toLocaleDateString()}</span>
+                                <span className="journal-category">PRESS RELEASE / NEWS</span>
+                            </div>
+                            <h1 className="journal-title">{safeRender(title) || 'UNTITLED ARTICLE'}</h1>
+                            {subtitle && <p className="journal-subtitle">{safeRender(subtitle)}</p>}
+                            <div className="journal-byline">
+                                <div className="byline-info">
+                                    <span className="by">By </span>
+                                    <span className="journalist-name">{displayAuthors || 'Anonymous'}</span>
+                                    {profession && <span className="journalist-profession">, {safeRender(profession)}</span>}
                                 </div>
-                                <h1 className="journal-title">{safeRender(title) || 'UNTITLED ARTICLE'}</h1>
-                                {subtitle && <p className="journal-subtitle">{safeRender(subtitle)}</p>}
-                                <div className="journal-byline">
-                                    <div className="byline-info">
-                                        <span className="by">By </span>
-                                        <span className="journalist-name">{displayAuthors || 'Anonymous'}</span>
-                                        {profession && <span className="journalist-profession">, {safeRender(profession)}</span>}
+                            </div>
+                        </header>
+                    ) : (
+                        <div className={`collapsible-section ${coverOpen ? 'open' : ''}`}>
+                            <div className="section-header" onClick={() => setCoverOpen(!coverOpen)}>
+                                {coverOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                <span>PRESS HEADER</span>
+                            </div>
+                            {coverOpen && (
+                                <header className="journal-header">
+                                    <div className="journal-meta-top">
+                                        <span className="journal-dateline">{date ? safeDate(date) : new Date().toLocaleDateString()}</span>
+                                        <span className="journal-category">PRESS RELEASE / NEWS</span>
                                     </div>
-                                </div>
-                            </header>
-                        )}
-                    </div>
+                                    <h1 className="journal-title">{safeRender(title) || 'UNTITLED ARTICLE'}</h1>
+                                    {subtitle && <p className="journal-subtitle">{safeRender(subtitle)}</p>}
+                                    <div className="journal-byline">
+                                        <div className="byline-info">
+                                            <span className="by">By </span>
+                                            <span className="journalist-name">{displayAuthors || 'Anonymous'}</span>
+                                            {profession && <span className="journalist-profession">, {safeRender(profession)}</span>}
+                                        </div>
+                                    </div>
+                                </header>
+                            )}
+                        </div>
+                    )
                 )}
 
                 {/* Table of Contents (Engineer Mode) */}
                 {isEngineer && showToC !== false && toc.length > 0 && (
-                    <div className={`collapsible-section ${tocOpen ? 'open' : ''}`} style={{ marginTop: coverOpen ? 0 : 20 }}>
-                        <div className="section-header" onClick={() => setTocOpen(!tocOpen)}>
-                            {tocOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                            <List size={14} style={{ marginLeft: 5 }} />
-                            <span>CONTENTS</span>
-                        </div>
-                        {tocOpen && (
-                            <div className="toc-block">
-                                <h2 style={{ fontSize: '1.2rem', marginBottom: 20 }}>Table of Contents</h2>
-                                <div className="toc-list">
-                                    {toc.map((h, i) => (
-                                        <div
-                                            key={i}
-                                            className={`toc-item level-${h.level}`}
-                                            style={{
-                                                marginLeft: (h.level - 1) * 20,
-                                                fontSize: h.level === 1 ? '1rem' : '0.9rem',
-                                                fontWeight: h.level === 1 ? 700 : 400,
-                                                marginBottom: 8,
-                                                display: 'flex',
-                                                justifyContent: 'space-between',
-                                                borderBottom: '1px dotted #ccc',
-                                                paddingBottom: 2
-                                            }}
-                                        >
-                                            <span className="toc-text">{h.text}</span>
-                                            <span className="toc-dots"></span>
-                                        </div>
-                                    ))}
-                                </div>
-
+                    isPrinting ? (
+                        <div className="toc-block" style={{ marginTop: 20 }}>
+                            <h2 style={{ fontSize: '1.2rem', marginBottom: 20 }}>Table of Contents</h2>
+                            <div className="toc-list">
+                                {toc.map((h, i) => (
+                                    <div
+                                        key={i}
+                                        className={`toc-item level-${h.level}`}
+                                        style={{
+                                            marginLeft: (h.level - 1) * 20,
+                                            fontSize: h.level === 1 ? '1rem' : '0.9rem',
+                                            fontWeight: h.level === 1 ? 700 : 400,
+                                            marginBottom: 8,
+                                            display: 'flex',
+                                            justifyContent: 'space-between',
+                                            borderBottom: '1px dotted #ccc',
+                                            paddingBottom: 2
+                                        }}
+                                    >
+                                        <span className="toc-text">{h.text}</span>
+                                        <span className="toc-dots"></span>
+                                    </div>
+                                ))}
                             </div>
-                        )}
-                    </div>
+                        </div>
+                    ) : (
+                        <div className={`collapsible-section ${tocOpen ? 'open' : ''}`} style={{ marginTop: coverOpen ? 0 : 20 }}>
+                            <div className="section-header" onClick={() => setTocOpen(!tocOpen)}>
+                                {tocOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                <List size={14} style={{ marginLeft: 5 }} />
+                                <span>CONTENTS</span>
+                            </div>
+                            {tocOpen && (
+                                <div className="toc-block">
+                                    <h2 style={{ fontSize: '1.2rem', marginBottom: 20 }}>Table of Contents</h2>
+                                    <div className="toc-list">
+                                        {toc.map((h, i) => (
+                                            <div
+                                                key={i}
+                                                className={`toc-item level-${h.level}`}
+                                                style={{
+                                                    marginLeft: (h.level - 1) * 20,
+                                                    fontSize: h.level === 1 ? '1rem' : '0.9rem',
+                                                    fontWeight: h.level === 1 ? 700 : 400,
+                                                    marginBottom: 8,
+                                                    display: 'flex',
+                                                    justifyContent: 'space-between',
+                                                    borderBottom: '1px dotted #ccc',
+                                                    paddingBottom: 2
+                                                }}
+                                            >
+                                                <span className="toc-text">{h.text}</span>
+                                                <span className="toc-dots"></span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )
                 )}
 
                 {!isEngineer && !isScript && !isScholar && !isJournalist && (title || displayAuthors || abstract || subtitle) && (
@@ -1220,6 +1521,8 @@ const MarkdownPreview = React.memo(function MarkdownPreview({ content, metadata,
                                     metadata={metadata}
                                     projectMetadata={projectMetadata}
                                     onDocumentLinkClick={onDocumentLinkClick}
+                                    isPrinting={isPrinting}
+                                    filePath={filePath}
                                 />
                             );
                         });
@@ -1348,6 +1651,7 @@ export function PreviewWrapper({ settings, content, metadata, projectMetadata, d
                         isEditingIdea={isEditingIdea}
                         onDocumentLinkClick={onDocumentLinkClick}
                         onNavigateToWord={onNavigateToWord}
+                        filePath={currentFilename}
                     />
                 </div>
 
@@ -1879,11 +2183,11 @@ function CommentCard({ comment, onReply, onResolve, onDelete }) {
 
 
 
-function AsyncImage({ src, alt, dirHandle, metadata, projectMetadata }) {
+function AsyncImage({ src, alt, dirHandle, metadata, projectMetadata, filePath, width: propWidth, style: propStyle, isPrinting }) {
     const [imgSrc, setImgSrc] = useState(src);
     // Format: Alt Text|width=...|id=...|label=...
     let displayAlt = alt || '';
-    let width = null;
+    let width = propWidth || (propStyle && propStyle.width) || null;
     let id = null;
     let label = null;
 
@@ -1895,57 +2199,76 @@ function AsyncImage({ src, alt, dirHandle, metadata, projectMetadata }) {
 
             for (let i = 1; i < parts.length; i++) {
                 const part = parts[i];
-                if (part.startsWith('width=')) width = part.replace('width=', '');
-                else if (part.startsWith('id=')) id = part.replace('id=', '');
-                else if (part.startsWith('label=')) label = part.replace('label=', '');
+                if (part.startsWith('width=')) {
+                    const extracted = part.replace('width=', '');
+                    if (extracted) width = extracted;
+                } else if (part.startsWith('id=')) {
+                    id = part.replace('id=', '');
+                } else if (part.startsWith('label=')) {
+                    label = part.replace('label=', '');
+                }
             }
         }
     }
+
+    const normalizedWidth = normalizeFigureWidth(width);
 
     // Caption Alignment: check metadata (file frontmatter) first, then projectMetadata
     const captionAlign = (metadata && metadata.captionAlignment) || (projectMetadata && projectMetadata.captionAlignment) || 'center';
 
     useEffect(() => {
+        if (!src) return;
+        if (src.startsWith('data:') || src.startsWith('http') || src.startsWith('blob:')) {
+            setImgSrc(src);
+            return;
+        }
         let objectUrl;
+        let isCancelled = false;
+
         const loadLocalImage = async () => {
-            // Only attempt to load if we have a directory handle and it's not an external URL
-            if (!dirHandle || !src || src.startsWith('http') || src.startsWith('blob:')) return;
+            if (!dirHandle) return;
 
             try {
-                // Assume src is relative path like "figures/image.png"
-                // We need to traverse the path relative to dirHandle
-                const parts = src.split('/');
-                let currentHandle = dirHandle;
+                const resolved = await resolveImageFile(src, dirHandle, filePath, projectMetadata);
+                if (isCancelled) return;
 
-                for (let i = 0; i < parts.length - 1; i++) {
-                    currentHandle = await currentHandle.getDirectoryHandle(parts[i]);
+                if (resolved?.file) {
+                    objectUrl = URL.createObjectURL(resolved.file);
+                    setImgSrc(objectUrl);
+                } else if (resolved?.buffer) {
+                    const mimeType = resolved.mimeType || getMimeType(src);
+                    const dataUrl = arrayBufferToDataUrl(resolved.buffer, mimeType);
+                    setImgSrc(dataUrl);
                 }
-
-                const fileHandle = await currentHandle.getFileHandle(parts[parts.length - 1]);
-                const file = await fileHandle.getFile();
-                objectUrl = URL.createObjectURL(file);
-                setImgSrc(objectUrl);
             } catch (err) {
-                console.warn('Failed to load local image:', src);
+                console.warn('Failed to load local image:', src, err);
             }
         };
 
         loadLocalImage();
 
         return () => {
+            isCancelled = true;
             if (objectUrl) URL.revokeObjectURL(objectUrl);
         };
-    }, [src, dirHandle]);
+    }, [src, dirHandle, filePath, projectMetadata]);
+
+    const strippedId = id ? id.replace(/^(fig|figure):/i, '') : '';
 
     return (
-        <figure id={id} style={{ textAlign: 'center', width: '100%', margin: '1.5rem 0' }}>
+        <figure id={id || undefined} style={{ textAlign: 'center', width: '100%', margin: '1.5rem 0' }}>
+            {strippedId && strippedId !== id && (
+                <span id={strippedId} style={{ position: 'relative', top: '-1rem', visibility: 'hidden' }} />
+            )}
             <img
                 src={imgSrc}
                 alt={displayAlt}
                 className="rounded-lg shadow-md mx-auto"
                 style={{
                     maxWidth: '100%',
-                    width: width || 'auto'
+                    width: normalizedWidth || 'auto',
+                    height: 'auto',
+                    ...propStyle
                 }}
             />
             {(displayAlt || label) && (

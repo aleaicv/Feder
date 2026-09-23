@@ -70,7 +70,14 @@ const createFileHandle = (path, name) => {
                 text: async () => await window.electronAPI.readFile(path),
                 arrayBuffer: async () => {
                     const buf = await window.electronAPI.readFileBuffer(path);
-                    return buf.buffer; // Convert Uint8Array to ArrayBuffer
+                    if (!buf) return new ArrayBuffer(0);
+                    // Safe slice to avoid returning the entire shared underlying buffer pool
+                    const offset = buf.byteOffset || 0;
+                    const length = buf.byteLength || buf.length || 0;
+                    if (buf.buffer instanceof ArrayBuffer) {
+                        return buf.buffer.slice(offset, offset + length);
+                    }
+                    return new Uint8Array(buf).buffer;
                 }
             };
         },
